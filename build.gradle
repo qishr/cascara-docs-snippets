@@ -3,12 +3,48 @@ ext.snippetsDir = "../qishr.github.io/src/snippets"
 ext.domains = [
     lang:   "../cascara-docs-examples/examples/lang",
     schema: "../cascara-docs-examples/examples/schema",
-    ui:     "../cascara-docs-examples/examples/ui"
+    ui:     "../cascara-docs-examples/examples/ui",
+    ct:     "../../theme/cascara-retro-theme",
 ]
 
 // ── Shared Methods ───────────────────────────────────────────────────────────
 
-ext.extractExampleSources = { sourceDir, outputDir ->
+// Helper to collect all properties from gradle.properties files walking up from target directory
+ext.loadProjectProperties = { File startingDir ->
+    Properties mergedProps = new Properties()
+    File currentDir = startingDir.canonicalFile
+
+    // Walk up directory tree to aggregate properties from root -> module hierarchy
+    List<File> propFiles = []
+    while (currentDir != null) {
+        File propsFile = new File(currentDir, "gradle.properties")
+        if (propsFile.exists()) {
+            propFiles.add(0, propsFile) // Prepend so closer/child properties override parent ones
+        }
+        currentDir = currentDir.parentFile
+    }
+
+    propFiles.each { file ->
+        file.withInputStream { mergedProps.load(it) }
+    }
+
+    return mergedProps
+}
+
+// Helper to substitute $key or ${key} variables present in source text
+ext.replaceProperties = { String text, Properties props ->
+    String result = text
+    props.each { key, val ->
+        def keyStr = key.toString()
+        def valStr = val.toString()
+        // Replaces both ${variable} and $variable forms
+        result = result.replace("\${${keyStr}}", valStr)
+                       .replace("\$${keyStr}", valStr)
+    }
+    return result
+}
+
+ext.extractExampleJavaSources = { sourceDir, outputDir ->
     if (!sourceDir.exists()) {
         throw new GradleException("Source directory not found: ${sourceDir}")
     }
@@ -41,24 +77,29 @@ ext.extractExampleSources = { sourceDir, outputDir ->
     println "Extracted ${count} example(s) to ${outputDir}"
 }
 
-ext.extractGradleDeps = { buildFile, outputPath ->
+ext.extractGradleSection = { sectionName, buildFile, outputPath ->
     if (!buildFile.exists()) {
         throw new GradleException("build.gradle not found: ${buildFile}")
     }
 
-    def lines = buildFile.text.readLines()
-    def depsIndex = lines.findIndexOf { it.trim() == "dependencies {" }
-    def trimmedLines = depsIndex >= 0 ? lines.drop(depsIndex) : lines
+    // Load all properties from gradle.properties up the directory tree
+    def props = loadProjectProperties(buildFile.parentFile)
+    def content = replaceProperties(buildFile.text, props)
 
-    def depsCloseIndex = trimmedLines.findIndexOf { it.trim() == "}" }
-    trimmedLines = depsCloseIndex >= 0 ? trimmedLines.take(depsCloseIndex + 1) : trimmedLines
+    def lines = content.readLines()
+    def sectionStart = sectionName + " {"
+    def sectionIndex = lines.findIndexOf { it.trim() == sectionStart }
+    def trimmedLines = sectionIndex >= 0 ? lines.drop(sectionIndex) : lines
+
+    def sectionCloseIndex = trimmedLines.findIndexOf { it.stripTrailing() == "}" }
+    trimmedLines = sectionCloseIndex >= 0 ? trimmedLines.take(sectionCloseIndex + 1) : trimmedLines
 
     while (!trimmedLines.isEmpty() && trimmedLines.first().trim().isEmpty()) {
         trimmedLines = trimmedLines.drop(1)
     }
 
     file(outputPath).text = trimmedLines.join("\n")
-    println "Extracted Gradle dependencies to ${outputPath}"
+    println "Extracted Gradle " + sectionName + " to ${outputPath}"
 }
 
 ext.convertGradleToMaven = { buildFile, outputPath ->
@@ -66,7 +107,11 @@ ext.convertGradleToMaven = { buildFile, outputPath ->
         throw new GradleException("build.gradle not found: ${buildFile}")
     }
 
-    def depLines = buildFile.text.readLines().findAll {
+    // Load all properties from gradle.properties up the directory tree
+    def props = loadProjectProperties(buildFile.parentFile)
+    def content = replaceProperties(buildFile.text, props)
+
+    def depLines = content.readLines().findAll {
         it.trim().startsWith("implementation ") ||
         it.trim().startsWith("implementation platform(")
     }
@@ -135,21 +180,29 @@ domains.each { name, examplesDir ->
     def extractMavenTask    = "extract${capitalized}MavenDeps"
 
     tasks.register(extractExamplesTask) {
-        group = "documentation"
-        description = "Extracts @Example-annotated Java classes for ${name}"
+        // Not everything has src/main/java...
+        if (file(packagePath).exists()) {
+            group = "documentation"
+            description = "Extracts @Example-annotated Java classes for ${name}"
 
-        def sourceDir = file("${examplesDir}/${packagePath}")
-        def outputDir = file("${snippetsDir}/examples/${name}")
+            def sourceDir = file("${examplesDir}/${packagePath}")
+            def outputDir = file("${snippetsDir}/examples/${name}")
 
-        inputs.dir(sourceDir)
-        outputs.dir(outputDir)
+            inputs.dir(sourceDir)
+            outputs.dir(outputDir)
 
-        doLast { extractExampleSources(sourceDir, outputDir) }
+            doLast { extractExampleJavaSources(sourceDir, outputDir) }
+        }
     }
 
     tasks.register(extractGradleTask) {
         group = "documentation"
         description = "Extracts Gradle dependencies for ${name}"
+
+        def section = "dependencies"
+        if (name == "ct") {
+            section = "ct"
+        }
 
         def buildFile  = file("${examplesDir}/build.gradle")
         def outputFile = file("${snippetsDir}/build-${name}.gradle")
@@ -157,7 +210,7 @@ domains.each { name, examplesDir ->
         dependsOn extractExamplesTask
         inputs.file(buildFile)
 
-        doLast { extractGradleDeps(buildFile, outputFile) }
+        doLast { extractGradleSection(section, buildFile, outputFile) }
     }
 
     tasks.register(extractMavenTask) {
